@@ -1,0 +1,5 @@
+python-telegram-bot[job-queue]==21.9
+anthropic>=0.40.0
+python-dotenv==1.0.1
+pytz==2024.1
+pymupdf==1.24.0

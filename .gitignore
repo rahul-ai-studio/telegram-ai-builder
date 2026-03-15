@@ -1,0 +1,53 @@
+# ── Secrets & config ──────────────────────────────
+.env
+*.env
+.env.*
+!.env.example
+
+# ── Database & runtime data ───────────────────────
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# ── Build output ──────────────────────────────────
+output/*
+!output/.gitkeep
+
+# ── Python ────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# ── Virtual environments ──────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── macOS ─────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# ── Claude Code internal files ────────────────────
+.claude/
+
+# ── IDE & editors ─────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*.orig
+.project
+.pydevproject
+
+# ── Logs ─────────────────────────────────────────
+*.log
+logs/
