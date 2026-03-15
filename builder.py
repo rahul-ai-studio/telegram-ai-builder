@@ -1,4 +1,15 @@
-"""Project builder and QA review using Claude API."""
+"""Project builder and QA review using Claude API.
+
+SECURITY
+────────
+• project_name is sanitized to [a-z0-9-_] only (max 60 chars).
+• Every file path returned by Claude is validated with _safe_path()
+  to ensure it cannot escape the project sandbox directory.
+  Path-traversal attempts raise ValueError and abort the build.
+• ValueError messages are safe to surface to the caller (no system paths).
+• All other exceptions are logged server-side only; the caller receives
+  a generic message.
+"""
 
 from __future__ import annotations
 
@@ -17,169 +28,198 @@ logger = logging.getLogger(__name__)
 DEFAULT_OUTPUT_DIR = os.path.expanduser("~/ai-builder-output")
 
 
+# ──────────────────────────────────────────────
+# Internal helpers
+# ──────────────────────────────────────────────
+
 def _get_client() -> anthropic.Anthropic:
-    """Get an Anthropic client instance."""
     return anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 
 def _strip_json_fences(text: str) -> str:
-    """Remove markdown code fences from JSON output."""
+    """Remove markdown code fences from JSON output if present."""
     text = text.strip()
-    # Remove ```json ... ``` or ``` ... ```
     text = re.sub(r"^```(?:json)?\s*\n?", "", text)
     text = re.sub(r"\n?```\s*$", "", text)
     return text.strip()
 
+
+def _sanitize_project_name(raw: str) -> str:
+    """Return a safe, filesystem-friendly project name.
+
+    Rules:
+    - lowercase
+    - only a-z, 0-9, hyphens, underscores
+    - no leading/trailing hyphens
+    - max 60 characters
+    - falls back to 'project' if nothing valid remains
+    """
+    name = raw.lower().strip()
+    name = re.sub(r"[^a-z0-9\-_]", "-", name)   # replace bad chars
+    name = re.sub(r"-{2,}", "-", name)            # collapse repeated hyphens
+    name = name.strip("-_")                        # strip leading/trailing
+    name = name[:60]
+    return name or "project"
+
+
+def _safe_path(base_dir: str, relative: str) -> str:
+    """Resolve *relative* against *base_dir* and verify it stays inside.
+
+    Raises ValueError on path-traversal attempts.
+    """
+    # Strip any leading slashes or drive letters
+    relative = relative.lstrip("/\\")
+    relative = re.sub(r"^[a-zA-Z]:[/\\]", "", relative)  # Windows drive prefix
+
+    resolved = os.path.realpath(os.path.join(base_dir, relative))
+    sandbox  = os.path.realpath(base_dir)
+
+    if not (resolved == sandbox or resolved.startswith(sandbox + os.sep)):
+        raise ValueError(
+            f"Path traversal blocked: '{relative}' resolves outside the project sandbox."
+        )
+    return resolved
+
+
+# ──────────────────────────────────────────────
+# Public API
+# ──────────────────────────────────────────────
 
 def build_project(prompt: str, output_base: str | None = None) -> dict:
     """Build a complete project from a text prompt using Claude.
 
     Args:
         prompt: Description of the project to build
-        output_base: Base directory for output (default: ~/ai-builder-output)
+        output_base: Override base directory (default: ~/ai-builder-output)
 
     Returns:
-        Dict with project details: project_name, description, directory,
-        files_created, setup_instructions, model_used, model_reason,
-        cost_usd, readme
+        Dict: project_name, description, directory, files_created,
+              setup_instructions, model_used, model_reason, cost_usd, readme
+
+    Raises:
+        ValueError: Safe-to-surface errors (bad JSON, missing keys, path traversal)
     """
     client = _get_client()
 
-    # Route to the appropriate model for build tasks
-    # Build tasks always use at least Sonnet
     model_id, model_reason = route_model(prompt)
 
-    # For build tasks, ensure at least Sonnet level
+    # Builds always use at least Sonnet
     if "haiku" in model_id:
-        model_id = MODEL_SONNET
+        model_id    = MODEL_SONNET
         model_reason = "Build tasks require Sonnet or higher"
 
-    logger.info(f"Building project with {model_id}: {prompt[:80]}...")
+    logger.info("Building project with %s: %s…", model_id, prompt[:80])
 
-    # Call Claude API
     message = client.messages.create(
         model=model_id,
         max_tokens=8000,
         system=SYSTEM_BUILDER,
-        messages=[
-            {
-                "role": "user",
-                "content": f"Build a complete project for: {prompt}",
-            }
-        ],
+        messages=[{"role": "user", "content": f"Build a complete project for: {prompt}"}],
     )
 
     raw_response = message.content[0].text
-
-    # Parse the JSON response
     cleaned = _strip_json_fences(raw_response)
+
     try:
         project_data = json.loads(cleaned)
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse project JSON: {e}")
-        logger.error(f"Raw response (first 500 chars): {raw_response[:500]}")
-        raise ValueError(f"Claude returned invalid JSON: {e}")
+    except json.JSONDecodeError as exc:
+        logger.error("Failed to parse project JSON: %s", exc)
+        raise ValueError("Claude returned invalid JSON. Please try again.") from exc
 
     # Validate required keys
-    required_keys = ["project_name", "description", "files", "setup_instructions", "readme"]
-    for key in required_keys:
+    for key in ("project_name", "description", "files", "setup_instructions", "readme"):
         if key not in project_data:
-            raise ValueError(f"Missing required key in project JSON: {key}")
+            raise ValueError(f"Incomplete project response (missing '{key}'). Please try again.")
 
-    # Determine output directory
-    base_dir = output_base if output_base else os.getenv("OUTPUT_DIR")
-    if base_dir:
-        base_dir = os.path.expanduser(base_dir)
-    else:
-        base_dir = DEFAULT_OUTPUT_DIR
+    # Sanitize project name — critical before using it as a directory name
+    raw_name     = str(project_data["project_name"])
+    project_name = _sanitize_project_name(raw_name)
+    if project_name != raw_name.lower().strip():
+        logger.info("project_name sanitized: '%s' → '%s'", raw_name, project_name)
 
-    project_name = project_data["project_name"]
+    # Resolve output directory
+    base_dir = output_base or os.getenv("OUTPUT_DIR")
+    base_dir = os.path.expanduser(base_dir) if base_dir else DEFAULT_OUTPUT_DIR
     project_dir = os.path.join(base_dir, project_name)
-
-    # Create project directory and write files
     os.makedirs(project_dir, exist_ok=True)
-    files_created = []
+
+    files_created: list[str] = []
 
     for file_info in project_data["files"]:
-        file_path = os.path.join(project_dir, file_info["path"])
-        parent_dir = os.path.dirname(file_path)
+        raw_file_path = str(file_info.get("path", "")).strip()
+        if not raw_file_path:
+            continue
 
-        if parent_dir:
-            os.makedirs(parent_dir, exist_ok=True)
+        # Validate path stays inside project sandbox
+        try:
+            safe_file_path = _safe_path(project_dir, raw_file_path)
+        except ValueError as exc:
+            logger.warning("Skipped unsafe path '%s': %s", raw_file_path, exc)
+            continue   # skip this file and carry on with the rest
 
-        with open(file_path, "w", encoding="utf-8") as f:
-            f.write(file_info["content"])
+        parent = os.path.dirname(safe_file_path)
+        os.makedirs(parent, exist_ok=True)
 
-        files_created.append(os.path.abspath(file_path))
-        logger.info(f"  Created: {file_info['path']}")
+        with open(safe_file_path, "w", encoding="utf-8") as fh:
+            fh.write(file_info.get("content", ""))
 
-    # Write README if not already in files
-    readme_exists = any(f["path"].lower() == "readme.md" for f in project_data["files"])
+        files_created.append(safe_file_path)
+        logger.info("  Created: %s", raw_file_path)
+
+    # Write README if not already included
+    readme_exists = any(
+        str(f.get("path", "")).lower() == "readme.md" for f in project_data["files"]
+    )
     if not readme_exists and project_data.get("readme"):
         readme_path = os.path.join(project_dir, "README.md")
-        with open(readme_path, "w", encoding="utf-8") as f:
-            f.write(project_data["readme"])
-        files_created.append(os.path.abspath(readme_path))
+        with open(readme_path, "w", encoding="utf-8") as fh:
+            fh.write(project_data["readme"])
+        files_created.append(readme_path)
 
-    # Calculate cost
-    usage = message.usage
+    usage    = message.usage
     cost_usd = estimate_cost(usage.input_tokens, usage.output_tokens, model_id)
 
-    result = {
-        "project_name": project_name,
-        "description": project_data["description"],
-        "directory": os.path.abspath(project_dir),
-        "files_created": files_created,
-        "setup_instructions": project_data["setup_instructions"],
-        "model_used": get_model_alias(model_id),
-        "model_reason": model_reason,
-        "cost_usd": cost_usd,
-        "readme": project_data.get("readme", ""),
-    }
+    logger.info("Project '%s' built — %d files, $%.6f", project_name, len(files_created), cost_usd)
 
-    logger.info(f"Project '{project_name}' built successfully in {project_dir}")
-    return result
+    return {
+        "project_name":      project_name,
+        "description":       project_data["description"],
+        "directory":         os.path.abspath(project_dir),
+        "files_created":     files_created,
+        "setup_instructions": project_data["setup_instructions"],
+        "model_used":        get_model_alias(model_id),
+        "model_reason":      model_reason,
+        "cost_usd":          cost_usd,
+        "readme":            project_data.get("readme", ""),
+    }
 
 
 def qa_review(project: dict) -> str:
-    """Run a quick QA review on the generated project files.
-
-    Args:
-        project: The project dict returned by build_project()
-
-    Returns:
-        Review text from Claude
-    """
+    """Quick QA review of the generated project using Claude Haiku."""
     client = _get_client()
 
-    # Collect file contents for review (up to 5 files, 500 chars each)
     file_summaries = []
-    files_to_review = project.get("files_created", [])[:5]
-
-    for file_path in files_to_review:
+    for file_path in project.get("files_created", [])[:5]:
         try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                content = f.read(500)
-            filename = os.path.basename(file_path)
-            file_summaries.append(f"--- {filename} ---\n{content}")
-        except Exception as e:
-            logger.warning(f"Could not read {file_path}: {e}")
+            with open(file_path, "r", encoding="utf-8") as fh:
+                content = fh.read(500)
+            file_summaries.append(f"--- {os.path.basename(file_path)} ---\n{content}")
+        except Exception as exc:
+            logger.warning("Could not read file for QA: %s", exc)
 
     if not file_summaries:
         return "No files available for review."
-
-    review_content = "\n\n".join(file_summaries)
 
     message = client.messages.create(
         model=MODEL_HAIKU,
         max_tokens=500,
         system=SYSTEM_QA,
-        messages=[
-            {
-                "role": "user",
-                "content": f"Review this project '{project['project_name']}':\n\n{review_content}",
-            }
-        ],
+        messages=[{
+            "role": "user",
+            "content": (
+                f"Review this project '{project['project_name']}':\n\n"
+                + "\n\n".join(file_summaries)
+            ),
+        }],
     )
-
     return message.content[0].text
